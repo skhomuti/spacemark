@@ -20,7 +20,6 @@ jobs:
       commit: ${{ steps.build.outputs.commit }}
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
-      APP_PATH: ${{ runner.temp }}/spacemark-build/Build/Products/Release/SpaceMark.app
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -31,6 +30,7 @@ jobs:
         id: build
         shell: bash
         run: |
+          APP_PATH="$RUNNER_TEMP/spacemark-build/Build/Products/Release/SpaceMark.app"
           set --
           if [[ "$GITHUB_EVENT_NAME" == push ]]; then
             version_pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
@@ -50,6 +50,7 @@ jobs:
           lipo "$APP_PATH/Contents/MacOS/SpaceMark" -verify_arch arm64 x86_64
           lipo "$APP_PATH/Contents/PlugIns/MarkdownPreview.appex/Contents/MacOS/MarkdownPreview" -verify_arch arm64 x86_64
           codesign --verify --deep --strict "$APP_PATH"
+          echo "APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
           echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Sign and notarize release
