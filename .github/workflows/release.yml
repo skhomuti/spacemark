@@ -1,0 +1,110 @@
+name: Build and release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: spacemark-release-${{ github.ref }}
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 35
+    outputs:
+      commit: ${{ steps.build.outputs.commit }}
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      APP_PATH: ${{ runner.temp }}/spacemark-build/Build/Products/Release/SpaceMark.app
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Build universal app
+        id: build
+        shell: bash
+        run: |
+          set --
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            version_pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+            if [[ ! "$GITHUB_REF_NAME" =~ $version_pattern ]]; then
+              echo "::error::Use a release tag such as v0.1.0."
+              exit 1
+            fi
+            set -- "MARKETING_VERSION=${GITHUB_REF_NAME#v}" "CURRENT_PROJECT_VERSION=$GITHUB_RUN_NUMBER"
+          fi
+          xcodebuild -version
+          xcodebuild -quiet \
+            -workspace SpaceMark.xcodeproj/project.xcworkspace -scheme SpaceMark \
+            -configuration Release -destination 'generic/platform=macOS' \
+            -derivedDataPath "$RUNNER_TEMP/spacemark-build" \
+            -disableAutomaticPackageResolution \
+            'ARCHS=arm64 x86_64' ONLY_ACTIVE_ARCH=NO "$@" build
+          lipo "$APP_PATH/Contents/MacOS/SpaceMark" -verify_arch arm64 x86_64
+          lipo "$APP_PATH/Contents/PlugIns/MarkdownPreview.appex/Contents/MacOS/MarkdownPreview" -verify_arch arm64 x86_64
+          codesign --verify --deep --strict "$APP_PATH"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Sign and notarize release
+        if: github.event_name == 'push'
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: ./script/sign_and_notarize.sh "$APP_PATH"
+
+      - name: Package app
+        id: package
+        shell: bash
+        run: |
+          version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_PATH/Contents/Info.plist")
+          if [[ "$GITHUB_EVENT_NAME" == push && "v$version" != "$GITHUB_REF_NAME" ]]; then
+            echo "::error::The app version does not match the release tag."
+            exit 1
+          fi
+          archive="$RUNNER_TEMP/SpaceMark-$version-macOS.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$archive"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: spacemark-macos
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: spacemark-macos
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILT_COMMIT: ${{ needs.build.outputs.commit }}
+        shell: bash
+        run: |
+          tagged_commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_REF_NAME" --jq .sha)
+          if [[ "$tagged_commit" != "$BUILT_COMMIT" ]]; then
+            echo "::error::The release tag moved after the build."
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" "SpaceMark-${GITHUB_REF_NAME#v}-macOS.zip" \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --title "SpaceMark $GITHUB_REF_NAME" --generate-notes
